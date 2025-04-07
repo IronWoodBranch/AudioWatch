@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时分贝监测与图表</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            transition: background-color 0.1s ease-in-out;
+            background-color: #f4f4f4;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            /* justify-content: center; */ /* Remove center to allow chart below */
+            padding-top: 20px; /* Add some padding */
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            background-color: white;
+            padding: 20px 30px; /* Adjust padding */
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            width: 90%;
+            max-width: 450px; /* Slightly wider */
+            margin-bottom: 20px; /* Add margin below container */
+        }
+
+        body.threshold-exceeded {
+            background-color: red;
+            color: white;
+        }
+        body.threshold-exceeded .container,
+        body.threshold-exceeded .chart-container { /* Style chart container too */
+             background-color: rgba(255, 255, 255, 0.2);
+             color: white;
+             border-color: rgba(255, 255, 255, 0.5); /* Adjust border */
+        }
+        body.threshold-exceeded a { color: #ffdddd; }
+        body.threshold-exceeded #volumeDisplay,
+        body.threshold-exceeded #thresholdValueDisplay { color: #ffffff; }
+        body.threshold-exceeded button {
+             background-color: #ff4d4d;
+             border: 1px solid white;
+         }
+        /* Chart specific styles */
+        body.threshold-exceeded .chart-container canvas {
+             /* Optional: if you want chart lines/text to change color too */
+             /* This usually needs to be done via chart.js options update */
+         }
+
+
+        #status { font-weight: bold; margin-bottom: 15px; min-height: 1.2em; }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="range"] { width: 70%; margin-bottom: 5px; vertical-align: middle;}
+        input[type="number"] { width: 60px; padding: 5px; text-align: center; margin-left: 10px; vertical-align: middle;}
+        #volumeDisplay, #thresholdValueDisplay { font-weight: bold; font-size: 1.5em; color: #007bff; min-height: 1.5em; display: inline-block; }
+        button { padding: 10px 20px; font-size: 1em; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; margin-top: 15px; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+
+        /* Chart Container Styles */
+        .chart-container {
+            width: 90%;
+            max-width: 600px; /* Chart can be wider */
+            height: 250px; /* Fixed height for the chart area */
+            margin: 20px auto;
+            background-color: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            position: relative; /* Needed for Chart.js responsiveness */
+            display: none; /* Initially hidden */
+        }
+
+    </style>
+    <!-- Include Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>实时分贝监测 (dBFS)</h1>
+        <p id="status">请点击下方按钮开始监测</p>
+
+        <div id="controls" style="display: none;">
+            <div class="control-group">
+                <label for="thresholdSlider">设置阈值:
+                    <span id="thresholdValueDisplay">-30</span> dBFS
+                </label>
+                <input type="range" id="thresholdSlider" min="-80" max="0" value="-30" step="1">
+                <input type="number" id="thresholdInput" min="-80" max="0" value="-30" step="1">
+            </div>
+
+            <div class="control-group">
+                <p>当前音量: <span id="volumeDisplay">-∞</span> dBFS</p>
+            </div>
+        </div>
+
+        <button id="startButton">开始监测</button>
+    </div>
+
+    <!-- Chart Canvas Container -->
+    <div class="chart-container" id="chartContainer">
+        <canvas id="dbChart"></canvas>
+    </div>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const statusElement = document.getElementById('status');
+        const controlsElement = document.getElementById('controls');
+        const thresholdSlider = document.getElementById('thresholdSlider');
+        const thresholdInput = document.getElementById('thresholdInput');
+        const thresholdValueDisplay = document.getElementById('thresholdValueDisplay');
+        const volumeDisplay = document.getElementById('volumeDisplay');
+        const bodyElement = document.body;
+        const chartContainer = document.getElementById('chartContainer');
+        const chartCanvas = document.getElementById('dbChart');
+
+
+        let audioContext;
+        let analyser;
+        let microphone;
+        let currentDb = -Infinity;
+        let threshold = parseFloat(thresholdInput.value);
+        let isMonitoring = false;
+        let animationFrameId;
+        const MIN_DB = -80.0;
+
+        // Chart specific variables
+        let dbChart = null; // Holds the chart instance
+        let chartUpdateIntervalId = null; // ID for setInterval
+        const CHART_UPDATE_INTERVAL_MS = 200; // Update chart 5 times per second
+        const CHART_HISTORY_SECONDS = 10;
+        const MAX_CHART_POINTS = (CHART_HISTORY_SECONDS * 1000) / CHART_UPDATE_INTERVAL_MS;
+
+        // --- Threshold Sync --- (Same as before)
+        thresholdSlider.addEventListener('input', () => {
+            threshold = parseFloat(thresholdSlider.value);
+            thresholdInput.value = threshold;
+            thresholdValueDisplay.textContent = threshold;
+            checkThreshold(currentDb);
+        });
+        thresholdInput.addEventListener('input', () => {
+            let value = parseFloat(thresholdInput.value);
+            if (isNaN(value)) value = threshold;
+            value = Math.max(parseFloat(thresholdInput.min), Math.min(parseFloat(thresholdInput.max), value));
+            threshold = value;
+            thresholdInput.value = threshold;
+            thresholdSlider.value = threshold;
+            thresholdValueDisplay.textContent = threshold;
+            checkThreshold(currentDb);
+        });
+
+        // --- Audio Processing Core ---
+        startButton.addEventListener('click', async () => {
+            if (!isMonitoring) {
+                await initializeAudio();
+            } else {
+                stopMonitoring();
+            }
+        });
+
+        async function initializeAudio() {
+            startButton.disabled = true;
+            statusElement.textContent = '正在请求麦克风权限...';
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                statusElement.textContent = '麦克风权限已获取，开始监测...';
+                controlsElement.style.display = 'block';
+                startButton.textContent = '停止监测';
+                startButton.disabled = false;
+                isMonitoring = true;
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                analyser.smoothingTimeConstant = 0.1;
+                const bufferLength = analyser.fftSize;
+                const dataArray = new Uint8Array(bufferLength);
+
+                microphone = audioContext.createMediaStreamSource(stream);
+                microphone.connect(analyser);
+
+                // Initialize or reset and show the chart
+                initializeChart();
+                chartContainer.style.display = 'block'; // Show chart container
+
+                // Start the audio processing loop
+                monitorAudio(dataArray);
+                // Start the chart update interval
+                startChartUpdates();
+
+
+            } catch (err) {
+                console.error('无法获取麦克风:', err);
+                statusElement.textContent = `错误: 无法访问麦克风 (${err.message})。请检查权限。`;
+                startButton.textContent = '开始监测';
+                startButton.disabled = false;
+                isMonitoring = false;
+                controlsElement.style.display = 'none';
+                chartContainer.style.display = 'none'; // Hide chart on error
+            }
+        }
+
+        function monitorAudio(dataArray) {
+            if (!isMonitoring) return;
+
+            analyser.getByteTimeDomainData(dataArray);
+
+            let sumOfSquares = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                const sample = (dataArray[i] / 128.0) - 1.0;
+                sumOfSquares += sample * sample;
+            }
+            const rms = Math.sqrt(sumOfSquares / dataArray.length);
+
+            if (rms > 0) {
+                currentDb = 20 * Math.log10(rms);
+                currentDb = Math.max(MIN_DB, currentDb);
+            } else {
+                currentDb = MIN_DB; // Use MIN_DB for display consistency
+            }
+
+            // Update the main dB display immediately
+            volumeDisplay.textContent = currentDb.toFixed(1);
+
+            // Check threshold immediately
+            checkThreshold(currentDb);
+
+            // Request next frame for continuous audio processing
+            animationFrameId = requestAnimationFrame(() => monitorAudio(dataArray));
+        }
+
+        // --- Chart Functions ---
+        function initializeChart() {
+            if (dbChart) { // If chart exists, destroy it first
+                dbChart.destroy();
+            }
+            const ctx = chartCanvas.getContext('2d');
+            dbChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [], // Will store timestamps or sequence numbers
+                    datasets: [{
+                        label: 'dBFS',
+                        data: [], // Will store dBFS values
+                        borderColor: 'rgb(54, 162, 235)', // Blue color
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.2, // Slight curve
+                        pointRadius: 0 // No dots on points
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false, // Allow chart to fill container height
+                    animation: false, // Disable animation for real-time feel
+                    scales: {
+                        x: {
+                           // type: 'time', // Could use time scale, but managing labels is simpler this way
+                           ticks: {
+                               display: false // Hide x-axis labels for simplicity
+                           },
+                           grid: {
+                               display: false // Hide x grid lines
+                           }
+                        },
+                        y: {
+                            min: MIN_DB,
+                            max: 5, // Go slightly above 0 for padding
+                            title: {
+                                display: true,
+                                text: 'dBFS Level'
+                            },
+                            grid: {
+                                color: '#e0e0e0' // Lighter grid lines
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false // Hide legend as there's only one dataset
+                        },
+                        tooltip: {
+                            enabled: false // Disable tooltips for performance/simplicity
+                        }
+                    }
+                }
+            });
+            // Initialize with empty data
+             dbChart.data.labels = [];
+             dbChart.data.datasets[0].data = [];
+             dbChart.update();
+        }
+
+        function startChartUpdates() {
+            if (chartUpdateIntervalId) {
+                clearInterval(chartUpdateIntervalId); // Clear previous interval if any
+            }
+            chartUpdateIntervalId = setInterval(() => {
+                 if (!isMonitoring || !dbChart) return; // Exit if not monitoring or chart not ready
+
+                 const now = Date.now(); // Or use a simple counter
+
+                 // Add new data
+                 dbChart.data.labels.push(now); // Use timestamp as label internally
+                 dbChart.data.datasets[0].data.push(currentDb);
+
+                 // Remove old data points exceeding history duration
+                 while (dbChart.data.labels.length > MAX_CHART_POINTS) {
+                     dbChart.data.labels.shift(); // Remove oldest label
+                     dbChart.data.datasets[0].data.shift(); // Remove oldest data point
+                 }
+
+                 // Update the chart
+                 dbChart.update();
+
+             }, CHART_UPDATE_INTERVAL_MS);
+        }
+
+        function stopChartUpdates() {
+             if (chartUpdateIntervalId) {
+                clearInterval(chartUpdateIntervalId);
+                chartUpdateIntervalId = null;
+             }
+             // Optionally clear chart data on stop, or leave it showing the last state
+             /*
+             if (dbChart) {
+                dbChart.data.labels = [];
+                dbChart.data.datasets[0].data = [];
+                dbChart.update();
+             }
+             */
+        }
+
+        // --- Threshold Check --- (Same as before)
+        function checkThreshold(dbValue) {
+            if (dbValue > threshold) {
+                if (!bodyElement.classList.contains('threshold-exceeded')) {
+                    bodyElement.classList.add('threshold-exceeded');
+                }
+            } else {
+                if (bodyElement.classList.contains('threshold-exceeded')) {
+                    bodyElement.classList.remove('threshold-exceeded');
+                }
+            }
+        }
+
+        // --- Stop Monitoring ---
+        function stopMonitoring() {
+             if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+             }
+             // Stop chart updates
+             stopChartUpdates();
+
+             if (microphone) {
+                 microphone.mediaStream.getTracks().forEach(track => track.stop());
+                 microphone.disconnect();
+                 microphone = null;
+             }
+             if (audioContext && audioContext.state !== 'closed') {
+                 audioContext.close().catch(e => console.error("Error closing AudioContext:", e));
+                 audioContext = null;
+             }
+
+             analyser = null;
+             isMonitoring = false;
+             statusElement.textContent = '监测已停止。';
+             startButton.textContent = '开始监测';
+             startButton.disabled = false;
+             volumeDisplay.textContent = '-∞';
+             bodyElement.classList.remove('threshold-exceeded');
+             // Optionally hide chart on stop:
+             // chartContainer.style.display = 'none';
+        }
+
+        window.addEventListener('beforeunload', stopMonitoring);
+
+    </script>
+</body>
+</html>
